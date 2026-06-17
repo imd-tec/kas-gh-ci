@@ -21,10 +21,6 @@ on:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-  # Persistent cache directories on the self-hosted runner so builds
-  # across commits/branches reuse the same sstate-cache and downloads.
-  SSTATE_DIR: /mnt/4TB/ci/yocto-cache/qcom-oss/sstate-cache
-  DL_DIR: /mnt/4TB/ci/yocto-cache/qcom-oss/dl-dir
 
 jobs:
   build:
@@ -73,8 +69,6 @@ jobs:
 
       - name: Build ${{ inputs.artifact-name }}
         env:
-          DL_DIR: ${{ env.DL_DIR }}
-          SSTATE_DIR: ${{ env.SSTATE_DIR }}
           KAS_BUILD_DIR: ${{ github.workspace }}/build
         run: |
           set -euo pipefail
