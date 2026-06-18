@@ -15,9 +15,41 @@ on:
         description: 'Base name for the build artifact'
         required: true
         type: string
+      use-temp-cache:
+        description: 'Use runner-local temp directories for SSTATE_DIR/DL_DIR instead of the system persistent cache'
+        required: false
+        type: boolean
+        default: false
+      rsync-enabled:
+        description: 'rsync matching build outputs to a remote host after the build'
+        required: false
+        type: boolean
+        default: false
+      rsync-host:
+        description: 'Hostname or IP of the rsync destination'
+        required: false
+        type: string
+        default: ''
+      rsync-user:
+        description: 'SSH user on the rsync host'
+        required: false
+        type: string
+        default: 'pi'
+      rsync-dest:
+        description: 'Absolute path on the rsync host to sync into (with trailing slash)'
+        required: false
+        type: string
+        default: ''
+      rsync-pattern:
+        description: 'Glob pattern for files to sync from deploy/images/<machine>/ (symlinks excluded)'
+        required: false
+        type: string
+        default: '*.swu'
     secrets:
       SLACK_WEBHOOK_URL:
         required: true
+      RSYNC_SSH_KEY:
+        required: false
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -62,10 +94,20 @@ jobs:
           done < <(git lfs ls-files -n)
           [ "$missing" -eq 0 ]
 
-      - name: Ensure persistent cache directories exist
+      - name: Configure and create cache directories
         run: |
-          mkdir -p "$SSTATE_DIR"
-          mkdir -p "$DL_DIR"
+          if [ "${{ inputs.use-temp-cache }}" = "true" ]; then
+            SSTATE_PATH="${RUNNER_TEMP}/sstate-cache"
+            DL_PATH="${RUNNER_TEMP}/downloads"
+            echo "SSTATE_DIR=${SSTATE_PATH}" >> "$GITHUB_ENV"
+            echo "SSTATE_CACHE=${SSTATE_PATH}" >> "$GITHUB_ENV"
+            echo "DL_DIR=${DL_PATH}" >> "$GITHUB_ENV"
+          else
+            SSTATE_PATH="$SSTATE_DIR"
+            DL_PATH="$DL_DIR"
+          fi
+          mkdir -p "$SSTATE_PATH"
+          mkdir -p "$DL_PATH"
 
       - name: Build ${{ inputs.artifact-name }}
         env:
@@ -120,6 +162,32 @@ jobs:
           name: ${{ inputs.artifact-name }}-${{ github.sha }}-kas-dump
           path: ${{ inputs.artifact-name }}-${{ github.sha }}-kas-dump.yml
           retention-days: 30
+
+      - name: rsync build outputs to LAVA server
+        if: success() && inputs.rsync-enabled
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          echo "${{ secrets.RSYNC_SSH_KEY }}" > ~/.ssh/rsync_key
+          chmod 600 ~/.ssh/rsync_key
+          ssh-keyscan -H "${{ inputs.rsync-host }}" >> ~/.ssh/known_hosts 2>/dev/null
+
+          # Stage only real files (no symlinks) matching the pattern
+          STAGE=$(mktemp -d)
+          find build/tmp/deploy/images/${{ inputs.machine }} \
+            -maxdepth 1 ! -type l -name "${{ inputs.rsync-pattern }}" \
+            -exec cp {} "$STAGE/" \;
+
+          echo "Files staged for rsync:"
+          ls -lh "$STAGE/"
+
+          # --delete keeps the destination clean — only the current build's files remain
+          rsync -av --delete \
+            -e "ssh -i ~/.ssh/rsync_key -o StrictHostKeyChecking=accept-new" \
+            "$STAGE/" \
+            "${{ inputs.rsync-user }}@${{ inputs.rsync-host }}:${{ inputs.rsync-dest }}"
+
+          rm -rf "$STAGE" ~/.ssh/rsync_key
 
       - name: Create GitHub release
         if: success() && startsWith(github.ref, 'refs/tags/')
