@@ -172,22 +172,14 @@ jobs:
           chmod 600 ~/.ssh/rsync_key
           ssh-keyscan -H "${{ inputs.rsync-host }}" >> ~/.ssh/known_hosts 2>/dev/null
 
-          # Stage only real files (no symlinks) matching the pattern
-          STAGE=$(mktemp -d)
-          find build/tmp/deploy/images/${{ inputs.machine }} \
-            -maxdepth 1 ! -type l -name "${{ inputs.rsync-pattern }}" \
-            -exec cp {} "$STAGE/" \;
-
-          echo "Files staged for rsync:"
-          ls -lh "$STAGE/"
-
-          # --delete keeps the destination clean — only the current build's files remain
-          rsync -av --delete \
+          # Follow symlinks so the stable (non-timestamped) name is used at the destination
+          rsync -av --copy-links \
             -e "ssh -i ~/.ssh/rsync_key -o StrictHostKeyChecking=accept-new" \
-            "$STAGE/" \
+            $(find build/tmp/deploy/images/${{ inputs.machine }} \
+                -maxdepth 1 -type l -name "${{ inputs.rsync-pattern }}") \
             "${{ inputs.rsync-user }}@${{ inputs.rsync-host }}:${{ inputs.rsync-dest }}"
 
-          rm -rf "$STAGE" ~/.ssh/rsync_key
+          rm -f ~/.ssh/rsync_key
 
       - name: Create GitHub release
         if: success() && startsWith(github.ref, 'refs/tags/')
