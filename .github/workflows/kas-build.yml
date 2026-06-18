@@ -66,6 +66,10 @@ jobs:
           # IMDT_DISTRO_VERSION (tag on tag builds, else describe/SHA).
           fetch-depth: 0
           fetch-tags: true
+          # Don't persist HTTPS credentials — the self-hosted runner's SSH
+          # config handles auth, and HTTPS token setup conflicts with it when
+          # this workflow is called from another repo.
+          persist-credentials: false
 
       - name: Determine distro version
         run: |
