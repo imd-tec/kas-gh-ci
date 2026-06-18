@@ -48,8 +48,6 @@ on:
     secrets:
       SLACK_WEBHOOK_URL:
         required: true
-      RSYNC_SSH_KEY:
-        required: false
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -166,20 +164,11 @@ jobs:
       - name: rsync build outputs to LAVA server
         if: success() && inputs.rsync-enabled
         run: |
-          mkdir -p ~/.ssh
-          chmod 700 ~/.ssh
-          echo "${{ secrets.RSYNC_SSH_KEY }}" > ~/.ssh/rsync_key
-          chmod 600 ~/.ssh/rsync_key
-          ssh-keyscan -H "${{ inputs.rsync-host }}" >> ~/.ssh/known_hosts 2>/dev/null
-
           # Follow symlinks so the stable (non-timestamped) name is used at the destination
           rsync -av --copy-links \
-            -e "ssh -i ~/.ssh/rsync_key -o StrictHostKeyChecking=accept-new" \
             $(find build/tmp/deploy/images/${{ inputs.machine }} \
                 -maxdepth 1 -type l -name "${{ inputs.rsync-pattern }}") \
             "${{ inputs.rsync-user }}@${{ inputs.rsync-host }}:${{ inputs.rsync-dest }}"
-
-          rm -f ~/.ssh/rsync_key
 
       - name: Create GitHub release
         if: success() && startsWith(github.ref, 'refs/tags/')
