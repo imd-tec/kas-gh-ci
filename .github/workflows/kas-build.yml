@@ -192,7 +192,7 @@ jobs:
             ${{ inputs.artifact-name }}-kas-dump.yml
 
   notify:
-    runs-on: imx-runner
+    runs-on: ubuntu-latest
     needs: build
     if: always()
     steps:
