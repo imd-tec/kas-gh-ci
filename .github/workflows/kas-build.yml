@@ -108,6 +108,7 @@ jobs:
             SSTATE_PATH="$SSTATE_DIR"
             DL_PATH="$DL_DIR"
           fi
+          echo "BB_HASHSERVE_DB_DIR=${SSTATE_DIR}" >> "${GITHUB_ENV}"
           mkdir -p "$SSTATE_PATH"
           mkdir -p "$DL_PATH"
 
