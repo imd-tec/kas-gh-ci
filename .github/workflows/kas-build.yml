@@ -48,6 +48,10 @@ on:
     secrets:
       SLACK_WEBHOOK_URL:
         required: true
+    outputs:
+      version:
+        description: 'Resolved git version (git describe) baked into the build'
+        value: ${{ jobs.build.outputs.version }}
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -56,6 +60,8 @@ jobs:
   build:
     runs-on: imx-runner
     timeout-minutes: 720  # 12 hours — Yocto builds can be long
+    outputs:
+      version: ${{ steps.version.outputs.version }}
 
     steps:
       - name: Checkout
@@ -72,9 +78,13 @@ jobs:
           persist-credentials: false
 
       - name: Determine distro version
+        id: version
         run: |
           set -euo pipefail
           VERSION="$(git describe --tags --always --dirty)"
+          # Expose as a workflow output so callers can pass it to downstream
+          # jobs (e.g. LAVA tests that assert the value baked into the image).
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           # Forward the resolved git version under two names:
           #   IMDT_DISTRO_VERSION  - consumed by repos that set DISTRO_VERSION
           #                          from it (e.g. meta-imdt-renesas/-imx).
