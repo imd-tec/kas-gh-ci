@@ -81,6 +81,11 @@ jobs:
         id: version
         run: |
           set -euo pipefail
+          # actions/checkout's fetch-tags isn't reliable on the reused
+          # self-hosted runner workspace, so tags can be missing and
+          # `git describe` falls back to a bare commit hash. Fetch them
+          # explicitly so we get the tag-based description.
+          git fetch --tags --force --quiet || echo "::warning::could not fetch tags; version may be a bare hash"
           VERSION="$(git describe --tags --always --dirty)"
           # Expose as a workflow output so callers can pass it to downstream
           # jobs (e.g. LAVA tests that assert the value baked into the image).
