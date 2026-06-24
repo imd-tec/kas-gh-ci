@@ -75,8 +75,15 @@ jobs:
         run: |
           set -euo pipefail
           VERSION="$(git describe --tags --always --dirty)"
+          # Forward the resolved git version under two names:
+          #   IMDT_DISTRO_VERSION  - consumed by repos that set DISTRO_VERSION
+          #                          from it (e.g. meta-imdt-renesas/-imx).
+          #   META_IMDT_LAYER_VERSION - consumed by repos that surface it as a
+          #                          dedicated os-release field (e.g. meta-imdt-qcom-oss).
+          # Both carry the same value; consumers opt in via their kas env block.
           echo "IMDT_DISTRO_VERSION=${VERSION}" >> "$GITHUB_ENV"
-          echo "Resolved IMDT_DISTRO_VERSION=${VERSION}"
+          echo "META_IMDT_LAYER_VERSION=${VERSION}" >> "$GITHUB_ENV"
+          echo "Resolved version=${VERSION}"
 
       - name: Ensure LFS objects are materialized
         run: |
@@ -124,14 +131,14 @@ jobs:
           echo "=== DL_DIR: ${DL_DIR} ==="
           echo "=== SSTATE_DIR: ${SSTATE_DIR} ==="
           echo "=== KAS Config: ${{ inputs.kas-config }} ==="
-          echo "=== IMDT_DISTRO_VERSION: ${IMDT_DISTRO_VERSION} ==="
+          echo "=== Version: ${IMDT_DISTRO_VERSION} ==="
 
-          # kas-container (v4.0) has no -e/--env flag, so forward
-          # IMDT_DISTRO_VERSION into the container via the runtime args. kas
-          # then passes it through to bitbake (see env: in kas/includes/base.yml
-          # and BB_ENV_PASSTHROUGH_ADDITIONS in the distro conf).
+          # kas-container (v4.0) has no -e/--env flag, so forward the version
+          # into the container via the runtime args under both supported names.
+          # kas then passes whichever the consumer declares through to bitbake
+          # (see env: in the consumer's kas includes and BB_ENV_PASSTHROUGH_ADDITIONS).
           kas-container --ssh-dir ~/.ssh/ \
-            --runtime-args "-e IMDT_DISTRO_VERSION=${IMDT_DISTRO_VERSION}" \
+            --runtime-args "-e IMDT_DISTRO_VERSION=${IMDT_DISTRO_VERSION} -e META_IMDT_LAYER_VERSION=${META_IMDT_LAYER_VERSION}" \
             build --update ${{ inputs.kas-config }}
 
       - name: Compress build artifacts
@@ -145,7 +152,7 @@ jobs:
           KAS_BUILD_DIR: ${{ github.workspace }}/build
         run: |
           kas-container --ssh-dir ~/.ssh/ \
-            --runtime-args "-e IMDT_DISTRO_VERSION=${IMDT_DISTRO_VERSION}" \
+            --runtime-args "-e IMDT_DISTRO_VERSION=${IMDT_DISTRO_VERSION} -e META_IMDT_LAYER_VERSION=${META_IMDT_LAYER_VERSION}" \
             dump --resolve-refs --resolve-local --sort ${{ inputs.kas-config }} \
             > ${{ inputs.artifact-name }}-${{ github.sha }}-kas-dump.yml
           cp ${{ inputs.artifact-name }}-${{ github.sha }}-kas-dump.yml ${{ inputs.artifact-name }}-kas-dump.yml
