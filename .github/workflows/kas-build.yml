@@ -79,6 +79,8 @@ jobs:
 
       - name: Determine distro version
         id: version
+        env:
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
           # actions/checkout's fetch-tags isn't reliable on the reused
@@ -86,7 +88,17 @@ jobs:
           # `git describe` falls back to a bare commit hash. Fetch them
           # explicitly so we get the tag-based description.
           git fetch --tags --force --quiet || echo "::warning::could not fetch tags; version may be a bare hash"
-          VERSION="$(git describe --tags --always --dirty)"
+          # On a pull_request the checked-out ref is an ephemeral merge commit,
+          # whose nearest tag can come from the base branch (e.g. a tag on
+          # master that isn't in the PR branch's own lineage). Describe the PR
+          # head instead so the version reflects the branch under test.
+          # (--dirty can't be combined with an explicit commit, and the CI
+          # checkout is clean anyway.)
+          if [ -n "${PR_HEAD_SHA}" ]; then
+            VERSION="$(git describe --tags --always "${PR_HEAD_SHA}")"
+          else
+            VERSION="$(git describe --tags --always --dirty)"
+          fi
           # Expose as a workflow output so callers can pass it to downstream
           # jobs (e.g. LAVA tests that assert the value baked into the image).
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
