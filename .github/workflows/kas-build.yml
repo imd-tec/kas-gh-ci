@@ -41,7 +41,7 @@ on:
         type: string
         default: ''
       rsync-pattern:
-        description: 'Glob pattern for files to sync from deploy/images/<machine>/ (symlinks excluded)'
+        description: 'Space-separated glob pattern(s) for files to sync from deploy/images/<machine>/. Both the stable-named symlinks and plain files are matched; when a symlink and its target both match, only the symlink (clean name) is synced.'
         required: false
         type: string
         default: '*.swu'
@@ -186,19 +186,46 @@ jobs:
       - name: rsync build outputs to LAVA server
         if: success() && inputs.rsync-enabled
         run: |
-          # Sync each matching symlink to the destination with the commit SHA
-          # embedded in the filename so every build's artifact is unambiguous.
-          # e.g. imdt-image-base.swu-imdt-8550-sbc.rootfs-abc1234.swu
+          # Sync each matching artifact to the destination with the commit SHA
+          # embedded in the filename (before the extension) so every build's
+          # artifact is unambiguous, e.g.
+          #   imdt-image-base.swu-imdt-8550-sbc.rootfs-abc1234.swu
+          #   BOOTAA64-abc1234.EFI
+          # rsync-pattern may list several space-separated globs. Both the
+          # stable-named symlinks and plain files are matched; when a symlink
+          # and the file it points at both match a glob, only the symlink
+          # (clean name) is synced so we never upload the timestamped twin.
           SHA="${{ github.sha }}"
-          find build/tmp/deploy/images/${{ inputs.machine }} \
-              -maxdepth 1 -type l -name "${{ inputs.rsync-pattern }}" | \
-          while read -r LINK; do
-            BASENAME=$(basename "$LINK")
-            DEST_NAME="${BASENAME%.swu}-${SHA}.swu"
-            rsync -av --copy-links \
-              "$LINK" \
-              "${{ inputs.rsync-user }}@${{ inputs.rsync-host }}:${{ inputs.rsync-dest }}${DEST_NAME}"
+          IMAGES_DIR="build/tmp/deploy/images/${{ inputs.machine }}"
+          DEST="${{ inputs.rsync-user }}@${{ inputs.rsync-host }}:${{ inputs.rsync-dest }}"
+
+          upload() {
+            SRC="$1"
+            BASENAME=$(basename "$SRC")
+            STEM="${BASENAME%.*}"
+            EXT="${BASENAME##*.}"
+            DEST_NAME="${STEM}-${SHA}.${EXT}"
+            rsync -av --copy-links "$SRC" "${DEST}${DEST_NAME}"
+          }
+
+          # Disable pathname expansion so the glob patterns reach find -name
+          # literally instead of being expanded against the build directory.
+          set -f
+          declare -A SEEN
+          for PATTERN in ${{ inputs.rsync-pattern }}; do
+            # Symlinks first: they carry the clean (stable) names.
+            while IFS= read -r LINK; do
+              SEEN["$(readlink -f "$LINK")"]=1
+              upload "$LINK"
+            done < <(find "$IMAGES_DIR" -maxdepth 1 -type l -name "$PATTERN")
+            # Plain files, skipping any already synced via their symlink.
+            while IFS= read -r FILE; do
+              if [ -z "${SEEN["$(readlink -f "$FILE")"]:-}" ]; then
+                upload "$FILE"
+              fi
+            done < <(find "$IMAGES_DIR" -maxdepth 1 -type f -name "$PATTERN")
           done
+          set +f
 
       - name: Create GitHub release
         if: success() && startsWith(github.ref, 'refs/tags/')
