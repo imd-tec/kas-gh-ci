@@ -227,12 +227,66 @@ jobs:
           done
           set +f
 
+      - name: Prepare release assets (split if over GitHub's 2 GiB limit)
+        id: release_assets
+        if: success() && startsWith(github.ref, 'refs/tags/')
+        run: |
+          set -euo pipefail
+          # The build artifact carries the commit SHA so per-build uploads never
+          # collide; the *release* assets use a clean, SHA-free name so consumers
+          # can wget them from a stable .../releases/latest/download/<name> URL.
+          SRC="${{ inputs.artifact-name }}-${{ github.sha }}.tar.zst"
+          RELEASE="${{ inputs.artifact-name }}.tar.zst"
+          # GitHub release assets are capped at 2 GiB per file. Split below that
+          # with headroom so the upload never bumps the ceiling.
+          CHUNK_MIB=1900
+          LIMIT=$(( CHUNK_MIB * 1024 * 1024 ))
+          SIZE=$(stat -c%s "$SRC")
+          if [ "$SIZE" -ge "$LIMIT" ]; then
+            echo "Tarball is ${SIZE} bytes (>= ${LIMIT}); splitting into ${CHUNK_MIB} MiB numbered parts."
+            # Produces RELEASE.part00, .part01, … that reassemble byte-for-byte
+            # with `cat RELEASE.part* > RELEASE`.
+            split --bytes="${CHUNK_MIB}M" --numeric-suffixes --suffix-length=2 "$SRC" "${RELEASE}.part"
+            # Checksum recorded against the reassembled (clean) name so a consumer
+            # can `sha256sum -c` it straight after concatenating the parts.
+            echo "$(sha256sum "$SRC" | cut -d' ' -f1)  ${RELEASE}" > "${RELEASE}.sha256"
+            ls -lh "${RELEASE}".part* "${RELEASE}.sha256"
+            {
+              echo "notes<<RELEASE_NOTES_EOF"
+              echo ""
+              echo "### Reassembling \`${RELEASE}\`"
+              echo ""
+              echo "This image exceeded GitHub's 2 GiB per-file release limit and was"
+              echo "split into numbered parts. Download every \`${RELEASE}.part*\` file, then:"
+              echo ""
+              echo '```sh'
+              echo "cat ${RELEASE}.part* > ${RELEASE}"
+              echo "sha256sum -c ${RELEASE}.sha256"
+              echo '```'
+              echo "RELEASE_NOTES_EOF"
+            } >> "$GITHUB_OUTPUT"
+          else
+            echo "Tarball is ${SIZE} bytes (< ${LIMIT}); uploading as a single asset."
+            # Clean-named copy so the single-file release asset uses the same
+            # stable name as the split case.
+            cp "$SRC" "$RELEASE"
+            echo "notes=" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Create GitHub release
         if: success() && startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
+          # When the tarball was split the single-file glob matches nothing and
+          # the .part*/.sha256 globs match; when it wasn't split the reverse is
+          # true. fail_on_unmatched_files defaults to false, so unmatched globs
+          # are skipped rather than failing the release.
+          append_body: true
+          body: ${{ steps.release_assets.outputs.notes }}
           files: |
-            ${{ inputs.artifact-name }}-${{ github.sha }}.tar.zst
+            ${{ inputs.artifact-name }}.tar.zst
+            ${{ inputs.artifact-name }}.tar.zst.part*
+            ${{ inputs.artifact-name }}.tar.zst.sha256
             ${{ inputs.artifact-name }}-${{ github.sha }}-kas-dump.yml
             ${{ inputs.artifact-name }}-kas-dump.yml
 
