@@ -45,6 +45,11 @@ on:
         required: false
         type: string
         default: '*.swu'
+      runner:
+        description: 'Label of the self-hosted runner to build on. Defaults to the on-prem runner; pass the cloud runner label to build on GCP.'
+        required: false
+        type: string
+        default: 'imx-runner'
     secrets:
       SLACK_WEBHOOK_URL:
         required: true
@@ -58,7 +63,7 @@ env:
 
 jobs:
   build:
-    runs-on: imx-runner
+    runs-on: ${{ inputs.runner || 'imx-runner' }}
     timeout-minutes: 720  # 12 hours — Yocto builds can be long
     outputs:
       version: ${{ steps.version.outputs.version }}
