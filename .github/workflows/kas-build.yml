@@ -232,11 +232,140 @@ jobs:
           done
           set +f
 
-      - name: Prepare release assets (split if over GitHub's 2 GiB limit)
-        id: release_assets
+      - name: Generate release notes from commits since the last tag
         if: success() && startsWith(github.ref, 'refs/tags/')
         run: |
           set -euo pipefail
+          # The release body is built up in this file: the changelog first, then
+          # any asset-handling instructions appended by the step below.
+          # RUNNER_TEMP rather than the workspace so the notes never land in a
+          # build directory or survive into an unrelated job on the persistent
+          # self-hosted checkout.
+          NOTES="${RUNNER_TEMP}/release-notes.md"
+          TAG="${GITHUB_REF_NAME}"
+
+          # Nearest release tag reachable from this one, looked up within the
+          # same tag series so repos that carry more than one (this workflow is
+          # shared, and tag schemes differ: 'v1.2.3', 'imdt-pico-bsp-v1.5.0',
+          # 'imdt-v2h-bsp-v1.0.0') compare against their own predecessor rather
+          # than whichever tag happens to be nearest. The series is the tag up
+          # to its first digit, so 'imdt-pico-bsp-v1.5.0' matches
+          # 'imdt-pico-bsp-v[0-9]*'. Tag names cannot contain glob characters
+          # (git check-ref-format rejects them), so this is safe to splice into
+          # a pattern.
+          SERIES="${TAG%%[0-9]*}"
+          if [ "$SERIES" = "$TAG" ]; then
+            # No digits at all — a one-off name rather than a version. Fall back
+            # to the nearest ancestor tag of any kind.
+            PREV="$(git describe --tags --abbrev=0 "${TAG}^" 2>/dev/null || true)"
+          else
+            PREV="$(git describe --tags --match "${SERIES}[0-9]*" --abbrev=0 "${TAG}^" 2>/dev/null || true)"
+          fi
+          # Empty PREV means the first release in this series; every commit up to
+          # the tag is then listed. Both lookups rely on the full history and
+          # tags fetched by the checkout step above (fetch-depth: 0,
+          # fetch-tags: true).
+          if [ -n "$PREV" ]; then
+            RANGE="${PREV}..${TAG}"
+          else
+            RANGE="$TAG"
+          fi
+
+          # Which section an area prefix belongs to. Commit subjects across the
+          # IMDT layer repos are written as "<area>: Summary", sometimes with
+          # several slash-separated areas ("meta/kas:", "ci/lava:"); the
+          # leftmost known area wins, so the prefix reads
+          # most-significant-area-first. Anything unrecognised (including
+          # subjects with no prefix at all) collects under "Other changes"
+          # rather than being dropped.
+          declare -A CAT_OF=(
+            [feat]=features [feature]=features
+            [fix]=fixes [bugfix]=fixes
+            [kernel]=kernel [linux]=kernel [dt]=kernel [dts]=kernel
+            [firmware]=kernel [u-boot]=kernel [u-boot-concept]=kernel
+            [bootloader]=kernel [atf]=kernel [tf-a]=kernel [optee]=kernel
+            [graphics]=kernel [gpu]=kernel [camera]=kernel [audio]=kernel
+            [display]=kernel [npu]=kernel
+            [meta]=bsp [recipe]=bsp [recipes]=bsp [kas]=bsp [distro]=bsp
+            [machine]=bsp [layer]=bsp [conf]=bsp [image]=bsp [swupdate]=bsp
+            [ci]=ci [lava]=ci [test]=ci [tests]=ci [gha]=ci [workflow]=ci
+            [docs]=docs [doc]=docs [readme]=docs
+          )
+          CAT_ORDER=(features fixes kernel bsp ci docs other)
+          declare -A CAT_TITLE=(
+            [features]="Features"
+            [fixes]="Fixes"
+            [kernel]="Kernel, firmware & drivers"
+            [bsp]="BSP, layers & recipes"
+            [ci]="CI & testing"
+            [docs]="Documentation"
+            [other]="Other changes"
+          )
+
+          declare -A LINES=()
+          COUNT=0
+          while IFS=$'\t' read -r SHA SUBJECT; do
+            [ -n "$SHA" ] || continue
+            COUNT=$((COUNT + 1))
+            CAT=other
+            PREFIX="${SUBJECT%%: *}"
+            # A prefix only counts when the subject really had a ": " separator
+            # and the part before it looks like an area tag rather than prose.
+            if [ "$PREFIX" != "$SUBJECT" ] && [[ "$PREFIX" =~ ^[A-Za-z0-9._/+-]{1,32}$ ]]; then
+              IFS='/' read -ra AREAS <<<"${PREFIX,,}"
+              for AREA in "${AREAS[@]}"; do
+                if [ -n "${CAT_OF[$AREA]:-}" ]; then
+                  CAT="${CAT_OF[$AREA]}"
+                  break
+                fi
+              done
+            fi
+            LINES[$CAT]+="- ${SUBJECT} (\`${SHA}\`)"$'\n'
+          done < <(git log --no-merges --format='%h%x09%s' "$RANGE" --)
+
+          if [ -n "$PREV" ]; then
+            SINCE="since \`${PREV}\`"
+          else
+            SINCE="in the first tagged release"
+          fi
+
+          {
+            echo "## What's changed"
+            echo ""
+            if [ "$COUNT" -eq 0 ]; then
+              # Possible when a tag is moved or re-cut on a commit that is
+              # already released.
+              echo "No commits ${SINCE}."
+            else
+              if [ "$COUNT" -eq 1 ]; then
+                echo "1 commit ${SINCE}."
+              else
+                echo "${COUNT} commits ${SINCE}."
+              fi
+              for CAT in "${CAT_ORDER[@]}"; do
+                [ -n "${LINES[$CAT]:-}" ] || continue
+                echo ""
+                echo "### ${CAT_TITLE[$CAT]}"
+                echo ""
+                printf '%s' "${LINES[$CAT]}"
+              done
+            fi
+            echo ""
+            echo "**Build:** \`${{ steps.version.outputs.version }}\` · [CI run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})"
+            if [ -n "$PREV" ]; then
+              echo ""
+              echo "**Full changelog:** ${{ github.server_url }}/${{ github.repository }}/compare/${PREV}...${TAG}"
+            fi
+          } > "$NOTES"
+
+          echo "=== Generated release notes (${RANGE}) ==="
+          cat "$NOTES"
+
+      - name: Prepare release assets (split if over GitHub's 2 GiB limit)
+        if: success() && startsWith(github.ref, 'refs/tags/')
+        run: |
+          set -euo pipefail
+          NOTES="${RUNNER_TEMP}/release-notes.md"
           # The build artifact carries the commit SHA so per-build uploads never
           # collide; the *release* assets use a clean, SHA-free name so consumers
           # can wget them from a stable .../releases/latest/download/<name> URL.
@@ -256,8 +385,9 @@ jobs:
             # can `sha256sum -c` it straight after concatenating the parts.
             echo "$(sha256sum "$SRC" | cut -d' ' -f1)  ${RELEASE}" > "${RELEASE}.sha256"
             ls -lh "${RELEASE}".part* "${RELEASE}.sha256"
+            # Appended to the notes written by the previous step, so the release
+            # body reads: changelog, then how to put the asset back together.
             {
-              echo "notes<<RELEASE_NOTES_EOF"
               echo ""
               echo "### Reassembling \`${RELEASE}\`"
               echo ""
@@ -268,14 +398,12 @@ jobs:
               echo "cat ${RELEASE}.part* > ${RELEASE}"
               echo "sha256sum -c ${RELEASE}.sha256"
               echo '```'
-              echo "RELEASE_NOTES_EOF"
-            } >> "$GITHUB_OUTPUT"
+            } >> "$NOTES"
           else
             echo "Tarball is ${SIZE} bytes (< ${LIMIT}); uploading as a single asset."
             # Clean-named copy so the single-file release asset uses the same
             # stable name as the split case.
             cp "$SRC" "$RELEASE"
-            echo "notes=" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Create GitHub release
@@ -286,8 +414,11 @@ jobs:
           # the .part*/.sha256 globs match; when it wasn't split the reverse is
           # true. fail_on_unmatched_files defaults to false, so unmatched globs
           # are skipped rather than failing the release.
-          append_body: true
-          body: ${{ steps.release_assets.outputs.notes }}
+          #
+          # The body is replaced (not appended to) so re-running a tag build
+          # regenerates the notes in place instead of stacking another copy
+          # underneath the previous one.
+          body_path: ${{ runner.temp }}/release-notes.md
           files: |
             ${{ inputs.artifact-name }}.tar.zst
             ${{ inputs.artifact-name }}.tar.zst.part*
