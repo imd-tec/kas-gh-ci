@@ -8,7 +8,11 @@ on:
         required: true
         type: string
       machine:
-        description: 'Machine name (used to locate deploy images)'
+        description: >
+          Machine name, or a space-separated list for a multiconfig build that
+          produces images for several machines in one bitbake invocation. Each
+          machine gets its own tarball and artifact; with a single machine the
+          artifact names are unchanged.
         required: true
         type: string
       artifact-name:
@@ -45,6 +49,11 @@ on:
         required: false
         type: string
         default: '*.swu'
+      rsync-machine:
+        description: 'Machine whose deploy dir is synced, for multi-machine builds. Defaults to the first entry of machine.'
+        required: false
+        type: string
+        default: ''
       runner:
         description: 'Label of the self-hosted runner to build on. Defaults to the on-prem runner; pass the cloud runner label to build on GCP.'
         required: false
@@ -157,9 +166,50 @@ jobs:
             build --update ${{ inputs.kas-config }}
 
       - name: Compress build artifacts
+        id: pack
         if: success()
+        env:
+          MACHINES: ${{ inputs.machine }}
+          ARTIFACT_NAME: ${{ inputs.artifact-name }}
+          SHA: ${{ github.sha }}
         run: |
-          tar --zstd -cf ${{ inputs.artifact-name }}-${{ github.sha }}.tar.zst -C build/tmp/deploy/images/${{ inputs.machine }} .
+          set -euo pipefail
+          read -ra MACHINE_LIST <<<"$MACHINES"
+          # One upload-artifact step per machine, and steps cannot be generated
+          # at run time, so the upload steps below are unrolled to a fixed count.
+          if [ "${#MACHINE_LIST[@]}" -gt 4 ]; then
+            echo "::error::at most 4 machines are supported"
+            exit 1
+          fi
+          # Read back by the release step so it doesn't have to re-derive names.
+          MANIFEST="${RUNNER_TEMP}/artifacts.txt"
+          : > "$MANIFEST"
+          IDX=0
+          for MACHINE in "${MACHINE_LIST[@]}"; do
+            IDX=$((IDX + 1))
+            # A multiconfig build needs a distinct TMPDIR per machine, so the
+            # deploy dir is build/tmp<suffix>/deploy/images/<machine>. Newest
+            # wins, so a stale dir from an earlier layout is ignored on the
+            # persistent self-hosted checkout.
+            DIR=$(ls -dt build/tmp*/deploy/images/"$MACHINE" 2>/dev/null | head -n1 || true)
+            if [ -z "$DIR" ]; then
+              echo "::error::no deploy images directory found for machine '$MACHINE'"
+              exit 1
+            fi
+            # Single-machine builds keep the historical names.
+            NAME="$ARTIFACT_NAME"
+            if [ "${#MACHINE_LIST[@]}" -gt 1 ]; then
+              NAME="${NAME}-${MACHINE}"
+            fi
+            TAR="${NAME}-${SHA}.tar.zst"
+            echo "=== ${MACHINE}: ${DIR} -> ${TAR} ==="
+            tar --zstd -cf "$TAR" -C "$DIR" .
+            echo "$TAR" >> "$MANIFEST"
+            {
+              echo "tar-${IDX}=${TAR}"
+              echo "name-${IDX}=${NAME}-${SHA}"
+            } >> "$GITHUB_OUTPUT"
+          done
 
       - name: Dump resolved KAS config
         if: success()
@@ -172,12 +222,37 @@ jobs:
             > ${{ inputs.artifact-name }}-${{ github.sha }}-kas-dump.yml
           cp ${{ inputs.artifact-name }}-${{ github.sha }}-kas-dump.yml ${{ inputs.artifact-name }}-kas-dump.yml
 
+      # One artifact per machine, so each board's deploy dir downloads on its own.
       - name: Upload build artifacts
-        if: success()
+        if: success() && steps.pack.outputs.tar-1 != ''
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ inputs.artifact-name }}-${{ github.sha }}
-          path: ${{ inputs.artifact-name }}-${{ github.sha }}.tar.zst
+          name: ${{ steps.pack.outputs.name-1 }}
+          path: ${{ steps.pack.outputs.tar-1 }}
+          retention-days: 30
+
+      - name: Upload build artifacts (machine 2)
+        if: success() && steps.pack.outputs.tar-2 != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pack.outputs.name-2 }}
+          path: ${{ steps.pack.outputs.tar-2 }}
+          retention-days: 30
+
+      - name: Upload build artifacts (machine 3)
+        if: success() && steps.pack.outputs.tar-3 != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pack.outputs.name-3 }}
+          path: ${{ steps.pack.outputs.tar-3 }}
+          retention-days: 30
+
+      - name: Upload build artifacts (machine 4)
+        if: success() && steps.pack.outputs.tar-4 != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pack.outputs.name-4 }}
+          path: ${{ steps.pack.outputs.tar-4 }}
           retention-days: 30
 
       - name: Upload resolved KAS dump
@@ -190,6 +265,9 @@ jobs:
 
       - name: rsync build outputs to LAVA server
         if: success() && inputs.rsync-enabled
+        env:
+          MACHINES: ${{ inputs.machine }}
+          RSYNC_MACHINE: ${{ inputs.rsync-machine }}
         run: |
           # Sync each matching artifact to the destination with the commit SHA
           # embedded in the filename (before the extension) so every build's
@@ -201,7 +279,12 @@ jobs:
           # and the file it points at both match a glob, only the symlink
           # (clean name) is synced so we never upload the timestamped twin.
           SHA="${{ github.sha }}"
-          IMAGES_DIR="build/tmp/deploy/images/${{ inputs.machine }}"
+          # Only one machine's outputs are synced: on a multi-machine build the
+          # boards produce identically named files that would collide at the
+          # destination.
+          read -ra MACHINE_LIST <<<"$MACHINES"
+          MACHINE="${RSYNC_MACHINE:-${MACHINE_LIST[0]}}"
+          IMAGES_DIR=$(ls -dt build/tmp*/deploy/images/"$MACHINE" 2>/dev/null | head -n1)
           DEST="${{ inputs.rsync-user }}@${{ inputs.rsync-host }}:${{ inputs.rsync-dest }}"
 
           upload() {
@@ -363,66 +446,73 @@ jobs:
 
       - name: Prepare release assets (split if over GitHub's 2 GiB limit)
         if: success() && startsWith(github.ref, 'refs/tags/')
+        env:
+          SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
           NOTES="${RUNNER_TEMP}/release-notes.md"
-          # The build artifact carries the commit SHA so per-build uploads never
-          # collide; the *release* assets use a clean, SHA-free name so consumers
-          # can wget them from a stable .../releases/latest/download/<name> URL.
-          SRC="${{ inputs.artifact-name }}-${{ github.sha }}.tar.zst"
-          RELEASE="${{ inputs.artifact-name }}.tar.zst"
+          # Assets are staged in their own directory so the release glob picks
+          # them up without also matching the SHA-named tarballs they came from.
+          OUT="${RUNNER_TEMP}/release"
+          rm -rf "$OUT"
+          mkdir -p "$OUT"
           # GitHub release assets are capped at 2 GiB per file. Split below that
           # with headroom so the upload never bumps the ceiling.
           CHUNK_MIB=1900
           LIMIT=$(( CHUNK_MIB * 1024 * 1024 ))
-          SIZE=$(stat -c%s "$SRC")
-          if [ "$SIZE" -ge "$LIMIT" ]; then
-            echo "Tarball is ${SIZE} bytes (>= ${LIMIT}); splitting into ${CHUNK_MIB} MiB numbered parts."
-            # Produces RELEASE.part00, .part01, … that reassemble byte-for-byte
-            # with `cat RELEASE.part* > RELEASE`.
-            split --bytes="${CHUNK_MIB}M" --numeric-suffixes --suffix-length=2 "$SRC" "${RELEASE}.part"
-            # Checksum recorded against the reassembled (clean) name so a consumer
-            # can `sha256sum -c` it straight after concatenating the parts.
-            echo "$(sha256sum "$SRC" | cut -d' ' -f1)  ${RELEASE}" > "${RELEASE}.sha256"
-            ls -lh "${RELEASE}".part* "${RELEASE}.sha256"
+          SPLIT=0
+          while IFS= read -r SRC; do
+            [ -n "$SRC" ] || continue
+            # The build artifact carries the commit SHA so per-build uploads never
+            # collide; the *release* assets use a clean, SHA-free name so consumers
+            # can wget them from a stable .../releases/latest/download/<name> URL.
+            RELEASE="$(basename "${SRC/-${SHA}/}")"
+            SIZE=$(stat -c%s "$SRC")
+            if [ "$SIZE" -ge "$LIMIT" ]; then
+              echo "${RELEASE} is ${SIZE} bytes (>= ${LIMIT}); splitting into ${CHUNK_MIB} MiB numbered parts."
+              # Produces RELEASE.part00, .part01, … that reassemble byte-for-byte
+              # with `cat RELEASE.part* > RELEASE`.
+              split --bytes="${CHUNK_MIB}M" --numeric-suffixes --suffix-length=2 "$SRC" "${OUT}/${RELEASE}.part"
+              # Checksum recorded against the reassembled (clean) name so a consumer
+              # can `sha256sum -c` it straight after concatenating the parts.
+              echo "$(sha256sum "$SRC" | cut -d' ' -f1)  ${RELEASE}" > "${OUT}/${RELEASE}.sha256"
+              SPLIT=1
+            else
+              echo "${RELEASE} is ${SIZE} bytes (< ${LIMIT}); uploading as a single asset."
+              cp "$SRC" "${OUT}/${RELEASE}"
+            fi
+          done < "${RUNNER_TEMP}/artifacts.txt"
+          ls -lh "$OUT"
+          if [ "$SPLIT" = "1" ]; then
             # Appended to the notes written by the previous step, so the release
             # body reads: changelog, then how to put the asset back together.
             {
               echo ""
-              echo "### Reassembling \`${RELEASE}\`"
+              echo "### Reassembling split assets"
               echo ""
-              echo "This image exceeded GitHub's 2 GiB per-file release limit and was"
-              echo "split into numbered parts. Download every \`${RELEASE}.part*\` file, then:"
+              echo "Images over GitHub's 2 GiB per-file release limit are split into"
+              echo "numbered parts. Download every \`<name>.part*\` file, then:"
               echo ""
               echo '```sh'
-              echo "cat ${RELEASE}.part* > ${RELEASE}"
-              echo "sha256sum -c ${RELEASE}.sha256"
+              echo "cat <name>.part* > <name>"
+              echo "sha256sum -c <name>.sha256"
               echo '```'
             } >> "$NOTES"
-          else
-            echo "Tarball is ${SIZE} bytes (< ${LIMIT}); uploading as a single asset."
-            # Clean-named copy so the single-file release asset uses the same
-            # stable name as the split case.
-            cp "$SRC" "$RELEASE"
           fi
 
       - name: Create GitHub release
         if: success() && startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          # When the tarball was split the single-file glob matches nothing and
-          # the .part*/.sha256 globs match; when it wasn't split the reverse is
-          # true. fail_on_unmatched_files defaults to false, so unmatched globs
-          # are skipped rather than failing the release.
+          # The staging dir holds one clean-named tarball per machine, or its
+          # .part*/.sha256 set when that tarball had to be split.
           #
           # The body is replaced (not appended to) so re-running a tag build
           # regenerates the notes in place instead of stacking another copy
           # underneath the previous one.
           body_path: ${{ runner.temp }}/release-notes.md
           files: |
-            ${{ inputs.artifact-name }}.tar.zst
-            ${{ inputs.artifact-name }}.tar.zst.part*
-            ${{ inputs.artifact-name }}.tar.zst.sha256
+            ${{ runner.temp }}/release/*
             ${{ inputs.artifact-name }}-${{ github.sha }}-kas-dump.yml
             ${{ inputs.artifact-name }}-kas-dump.yml
 
