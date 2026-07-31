@@ -139,22 +139,67 @@ jobs:
             SSTATE_PATH="$SSTATE_DIR"
             DL_PATH="$DL_DIR"
           fi
-          echo "BB_HASHSERVE_DB_DIR=${SSTATE_DIR}" >> "${GITHUB_ENV}"
           mkdir -p "$SSTATE_PATH"
           mkdir -p "$DL_PATH"
+          # Keep the hashequiv DB alongside the sstate cache. bitbake defaults it
+          # to CACHE, i.e. inside the build tree, which oe-core's sanity check
+          # warns about once SSTATE_DIR is shared between builds — the hashequiv
+          # data is what makes those sstate objects reusable. A caller that
+          # exports its own BB_HASHSERVE_DB_DIR (e.g. a central hashserv dir)
+          # wins.
+          HASHSERVE_DB_PATH="${BB_HASHSERVE_DB_DIR:-$SSTATE_PATH}"
+          # bitbake hard-fails if BB_HASHSERVE_DB_DIR is explicitly set to an NFS
+          # path (sqlite locking), so leave it at the default there rather than
+          # breaking the build to silence a warning.
+          if [ "$(stat -f -c %T "$SSTATE_PATH" 2>/dev/null)" = "nfs" ] \
+             && [ "$HASHSERVE_DB_PATH" = "$SSTATE_PATH" ]; then
+            echo "::notice::SSTATE_DIR is on NFS — leaving BB_HASHSERVE_DB_DIR unset; run a shared hashserv instead"
+            echo "KAS_CI_EXTRA_CONFIG=" >> "$GITHUB_ENV"
+          else
+            # Setting the variable on the host is not enough on its own: no
+            # released kas forwards BB_HASHSERVE_DB_DIR into the container —
+            # that is siemens/kas 72adc606, still unreleased (4 commits past tag
+            # 5.4) — and bitbake's own preserved-env list does not include it
+            # either, so it has to arrive via BB_ENV_PASSTHROUGH_ADDITIONS.
+            # What every kas does support is an `env:` block, whose keys kas
+            # appends to BB_ENV_PASSTHROUGH_ADDITIONS, so declare it there
+            # instead and point it at /sstate — the in-container mount of
+            # SSTATE_DIR. kas deep-merges config files, so a consumer's own
+            # `env:` block (IMDT_DISTRO_VERSION et al) survives.
+            #
+            # Once the runners run a kas with 72adc606, the host value below is
+            # forwarded as /bb-hashserve-db and overrides this default. Both name
+            # the same host directory, so either path is correct.
+            echo "BB_HASHSERVE_DB_DIR=${HASHSERVE_DB_PATH}" >> "$GITHUB_ENV"
+            mkdir -p "$HASHSERVE_DB_PATH"
+            # version 14 is accepted by every kas from 4.0 up (4.0 tops out
+            # there, 4.7+ accept up to 23), and kas takes the max across merged
+            # files, so this cannot pull a consumer's config version down.
+            cat > .kas-ci-hashserve.yml <<'EOF'
+          header:
+            version: 14
+          env:
+            BB_HASHSERVE_DB_DIR: "/sstate"
+          EOF
+            echo "KAS_CI_EXTRA_CONFIG=:.kas-ci-hashserve.yml" >> "$GITHUB_ENV"
+          fi
 
       - name: Build ${{ inputs.artifact-name }}
         env:
           KAS_BUILD_DIR: ${{ github.workspace }}/build
+          # KAS_CI_EXTRA_CONFIG is appended by the cache-directory step: it adds
+          # the generated hashequiv overlay, or is empty when that was skipped.
+          KAS_CONFIG: ${{ inputs.kas-config }}
         run: |
           set -euo pipefail
+          KAS_CONFIG="${KAS_CONFIG}${KAS_CI_EXTRA_CONFIG:-}"
 
           echo "=== Building ${{ inputs.artifact-name }} ==="
           echo "=== Commit: $(git rev-parse HEAD) ==="
           echo "=== Branch: ${GITHUB_REF_NAME} ==="
           echo "=== DL_DIR: ${DL_DIR} ==="
           echo "=== SSTATE_DIR: ${SSTATE_DIR} ==="
-          echo "=== KAS Config: ${{ inputs.kas-config }} ==="
+          echo "=== KAS Config: ${KAS_CONFIG} ==="
           echo "=== Version: ${IMDT_DISTRO_VERSION} ==="
 
           # kas-container (v4.0) has no -e/--env flag, so forward the version
@@ -163,7 +208,7 @@ jobs:
           # (see env: in the consumer's kas includes and BB_ENV_PASSTHROUGH_ADDITIONS).
           kas-container --ssh-dir ~/.ssh/ \
             --runtime-args "-e IMDT_DISTRO_VERSION=${IMDT_DISTRO_VERSION} -e META_IMDT_LAYER_VERSION=${META_IMDT_LAYER_VERSION}" \
-            build --update ${{ inputs.kas-config }}
+            build --update "${KAS_CONFIG}"
 
       - name: Compress build artifacts
         id: pack
@@ -215,10 +260,14 @@ jobs:
         if: success()
         env:
           KAS_BUILD_DIR: ${{ github.workspace }}/build
+          KAS_CONFIG: ${{ inputs.kas-config }}
         run: |
+          # Same config string as the build, overlay included, so the dumped
+          # artifact records what was actually built.
+          KAS_CONFIG="${KAS_CONFIG}${KAS_CI_EXTRA_CONFIG:-}"
           kas-container --ssh-dir ~/.ssh/ \
             --runtime-args "-e IMDT_DISTRO_VERSION=${IMDT_DISTRO_VERSION} -e META_IMDT_LAYER_VERSION=${META_IMDT_LAYER_VERSION}" \
-            dump --resolve-refs --resolve-local --sort ${{ inputs.kas-config }} \
+            dump --resolve-refs --resolve-local --sort "${KAS_CONFIG}" \
             > ${{ inputs.artifact-name }}-${{ github.sha }}-kas-dump.yml
           cp ${{ inputs.artifact-name }}-${{ github.sha }}-kas-dump.yml ${{ inputs.artifact-name }}-kas-dump.yml
 
