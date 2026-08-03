@@ -19,6 +19,19 @@ on:
         description: 'Base name for the build artifact'
         required: true
         type: string
+      upload-artifacts:
+        description: >
+          Pack each machine's deploy dir into a tarball and upload it as a
+          workflow artifact. Packing multi-GB images with zstd and pushing them
+          to the artifact store is by far the slowest post-build step, so a
+          caller whose consumers get the images another way (e.g. rsync to a
+          test server) can set this false to skip both. Tag builds pack
+          regardless, because the GitHub release assets are made from those
+          tarballs — only the artifact upload itself is skipped there. The
+          resolved KAS dump is small and always uploaded.
+        required: false
+        type: boolean
+        default: true
       clean-checkout:
         description: >
           Run actions/checkout's clean step (git clean -ffdx && git reset
@@ -226,9 +239,10 @@ jobs:
             --runtime-args "-e IMDT_DISTRO_VERSION=${IMDT_DISTRO_VERSION} -e META_IMDT_LAYER_VERSION=${META_IMDT_LAYER_VERSION}" \
             build --update "${KAS_CONFIG}"
 
+      # Tag builds always pack: the release assets are cut from these tarballs.
       - name: Compress build artifacts
         id: pack
-        if: success()
+        if: success() && (inputs.upload-artifacts || startsWith(github.ref, 'refs/tags/'))
         env:
           MACHINES: ${{ inputs.machine }}
           ARTIFACT_NAME: ${{ inputs.artifact-name }}
@@ -277,6 +291,13 @@ jobs:
             } >> "$GITHUB_OUTPUT"
           done
 
+      # With packing skipped, nothing else clears the previous run's multi-GB
+      # tarballs out of the persistent self-hosted checkout (clean-checkout:
+      # false keeps untracked files), so drop them here instead.
+      - name: Remove stale build tarballs
+        if: ${{ success() && !inputs.upload-artifacts && !startsWith(github.ref, 'refs/tags/') }}
+        run: rm -f -- *.tar.zst
+
       - name: Dump resolved KAS config
         if: success()
         env:
@@ -294,7 +315,7 @@ jobs:
 
       # One artifact per machine, so each board's deploy dir downloads on its own.
       - name: Upload build artifacts
-        if: success() && steps.pack.outputs.tar-1 != ''
+        if: success() && inputs.upload-artifacts && steps.pack.outputs.tar-1 != ''
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.pack.outputs.name-1 }}
@@ -302,7 +323,7 @@ jobs:
           retention-days: 30
 
       - name: Upload build artifacts (machine 2)
-        if: success() && steps.pack.outputs.tar-2 != ''
+        if: success() && inputs.upload-artifacts && steps.pack.outputs.tar-2 != ''
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.pack.outputs.name-2 }}
@@ -310,7 +331,7 @@ jobs:
           retention-days: 30
 
       - name: Upload build artifacts (machine 3)
-        if: success() && steps.pack.outputs.tar-3 != ''
+        if: success() && inputs.upload-artifacts && steps.pack.outputs.tar-3 != ''
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.pack.outputs.name-3 }}
@@ -318,7 +339,7 @@ jobs:
           retention-days: 30
 
       - name: Upload build artifacts (machine 4)
-        if: success() && steps.pack.outputs.tar-4 != ''
+        if: success() && inputs.upload-artifacts && steps.pack.outputs.tar-4 != ''
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.pack.outputs.name-4 }}
