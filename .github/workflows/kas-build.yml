@@ -32,6 +32,17 @@ on:
         required: false
         type: boolean
         default: true
+      pack-exclude:
+        description: >
+          Space-separated path(s), relative to deploy/images/<machine>, left out
+          of each machine's tarball, and so out of both the workflow artifact
+          and the release assets cut from it. For build-internal outputs that
+          consumers do not need, e.g. ostree_repo, whose entire content is
+          already shipped by the per-image .ostreecommit.tar.xz. Each entry
+          excludes that path and everything under it.
+        required: false
+        type: string
+        default: ''
       clean-checkout:
         description: >
           Run actions/checkout's clean step (git clean -ffdx && git reset
@@ -247,6 +258,7 @@ jobs:
           MACHINES: ${{ inputs.machine }}
           ARTIFACT_NAME: ${{ inputs.artifact-name }}
           SHA: ${{ github.sha }}
+          PACK_EXCLUDE: ${{ inputs.pack-exclude }}
         run: |
           set -euo pipefail
           # With clean-checkout: false the workspace is no longer wiped between
@@ -255,6 +267,13 @@ jobs:
           # first is safe.
           rm -f -- *.tar.zst
           read -ra MACHINE_LIST <<<"$MACHINES"
+          # Anchored with ./ so a pattern matches the member names `tar -C
+          # "$DIR" .` produces, and only at the top of the deploy dir.
+          EXCLUDE_ARGS=()
+          read -ra EXCLUDE_LIST <<<"${PACK_EXCLUDE:-}"
+          for PATTERN in ${EXCLUDE_LIST[@]+"${EXCLUDE_LIST[@]}"}; do
+            EXCLUDE_ARGS+=("--exclude=./${PATTERN}")
+          done
           # One upload-artifact step per machine, and steps cannot be generated
           # at run time, so the upload steps below are unrolled to a fixed count.
           if [ "${#MACHINE_LIST[@]}" -gt 4 ]; then
@@ -282,8 +301,8 @@ jobs:
               NAME="${NAME}-${MACHINE}"
             fi
             TAR="${NAME}-${SHA}.tar.zst"
-            echo "=== ${MACHINE}: ${DIR} -> ${TAR} ==="
-            tar --zstd -cf "$TAR" -C "$DIR" .
+            echo "=== ${MACHINE}: ${DIR} -> ${TAR}${PACK_EXCLUDE:+ (excluding ${PACK_EXCLUDE})} ==="
+            tar --zstd -cf "$TAR" ${EXCLUDE_ARGS[@]+"${EXCLUDE_ARGS[@]}"} -C "$DIR" .
             echo "$TAR" >> "$MANIFEST"
             {
               echo "tar-${IDX}=${TAR}"
