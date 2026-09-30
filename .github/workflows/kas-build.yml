@@ -558,6 +558,7 @@ jobs:
         if: success() && startsWith(github.ref, 'refs/tags/')
         env:
           SHA: ${{ github.sha }}
+          MACHINES: ${{ inputs.machine }}
         run: |
           set -euo pipefail
           NOTES="${RUNNER_TEMP}/release-notes.md"
@@ -592,6 +593,25 @@ jobs:
               cp "$SRC" "${OUT}/${RELEASE}"
             fi
           done < "${RUNNER_TEMP}/artifacts.txt"
+          # Each image's package list (Yocto's <image>-<machine>.rootfs.manifest, a
+          # few hundred KB) as its own asset, so consumers can see what is in a
+          # release without downloading the multi-GB tarball. The stable names are
+          # symlinks to the timestamped files; -L copies the target. The machine
+          # is already part of each name, so machines cannot collide.
+          read -ra MACHINE_LIST <<<"$MACHINES"
+          for MACHINE in "${MACHINE_LIST[@]}"; do
+            DIR=$(ls -dt build/tmp*/deploy/images/"$MACHINE" 2>/dev/null | head -n1 || true)
+            [ -n "$DIR" ] || continue
+            TS='[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]'   # YYYYMMDDhhmmss
+            find "$DIR" -maxdepth 1 -name '*.manifest' ! -name "*-${TS}.*" -print0 |
+              while IFS= read -r -d '' M; do
+                # a package list must never fail the release: skip a dangling link
+                if [ -e "$M" ]; then
+                  cp -L "$M" "${OUT}/$(basename "$M")"
+                  echo "Package list: $(basename "$M")"
+                fi
+              done
+          done
           ls -lh "$OUT"
           if [ "$SPLIT" = "1" ]; then
             # Appended to the notes written by the previous step, so the release
