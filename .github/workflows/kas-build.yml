@@ -32,6 +32,17 @@ on:
         required: false
         type: boolean
         default: true
+      release-files:
+        description: >
+          Space-separated glob(s), matched in each machine's deploy dir, of the
+          files to publish on a tag release in place of the packed deploy
+          tarball, e.g. 'qcom-minimal-image-*.rootfs.qcomflash.tar.gz'. Symlinks
+          are followed, so the stable names are published. Name images
+          explicitly: a persistent deploy dir can hold stale images from older
+          builds. When set, tag builds no longer pack the deploy dir.
+        required: false
+        type: string
+        default: ''
       pack-exclude:
         description: >
           Space-separated path(s), relative to deploy/images/<machine>, left out
@@ -250,10 +261,10 @@ jobs:
             --runtime-args "-e IMDT_DISTRO_VERSION=${IMDT_DISTRO_VERSION} -e META_IMDT_LAYER_VERSION=${META_IMDT_LAYER_VERSION}" \
             build --update "${KAS_CONFIG}"
 
-      # Tag builds always pack: the release assets are cut from these tarballs.
+      # Tag builds pack too, unless release-files picks the release assets.
       - name: Compress build artifacts
         id: pack
-        if: success() && (inputs.upload-artifacts || startsWith(github.ref, 'refs/tags/'))
+        if: success() && (inputs.upload-artifacts || (startsWith(github.ref, 'refs/tags/') && inputs.release-files == ''))
         env:
           MACHINES: ${{ inputs.machine }}
           ARTIFACT_NAME: ${{ inputs.artifact-name }}
@@ -314,7 +325,7 @@ jobs:
       # tarballs out of the persistent self-hosted checkout (clean-checkout:
       # false keeps untracked files), so drop them here instead.
       - name: Remove stale build tarballs
-        if: ${{ success() && !inputs.upload-artifacts && !startsWith(github.ref, 'refs/tags/') }}
+        if: ${{ success() && !inputs.upload-artifacts && (!startsWith(github.ref, 'refs/tags/') || inputs.release-files != '') }}
         run: rm -f -- *.tar.zst
 
       - name: Dump resolved KAS config
@@ -559,6 +570,7 @@ jobs:
         env:
           SHA: ${{ github.sha }}
           MACHINES: ${{ inputs.machine }}
+          RELEASE_FILES: ${{ inputs.release-files }}
         run: |
           set -euo pipefail
           NOTES="${RUNNER_TEMP}/release-notes.md"
@@ -572,12 +584,41 @@ jobs:
           CHUNK_MIB=1900
           LIMIT=$(( CHUNK_MIB * 1024 * 1024 ))
           SPLIT=0
+          read -ra MACHINE_LIST <<<"$MACHINES"
+          if [ -n "$RELEASE_FILES" ]; then
+            # Whitelisted files only. Anything over the limit is still split.
+            : > "${RUNNER_TEMP}/artifacts.txt"
+            read -ra PATTERNS <<<"$RELEASE_FILES"
+            for MACHINE in "${MACHINE_LIST[@]}"; do
+              DIR=$(ls -dt build/tmp*/deploy/images/"$MACHINE" 2>/dev/null | head -n1 || true)
+              [ -n "$DIR" ] || continue
+              for PATTERN in "${PATTERNS[@]}"; do
+                find "$DIR" -maxdepth 1 \( -type f -o -type l \) -name "$PATTERN" -print0 |
+                  while IFS= read -r -d '' F; do
+                    [ -e "$F" ] || continue
+                    cp -L "$F" "${OUT}/$(basename "$F")"
+                    echo "Release file: $(basename "$F")"
+                  done
+              done
+            done
+            if [ -z "$(ls -A "$OUT")" ]; then
+              echo "::error::no deploy files matched release-files '${RELEASE_FILES}'"
+              exit 1
+            fi
+            for F in "$OUT"/*; do
+              if [ "$(stat -c%s "$F")" -ge "$LIMIT" ]; then
+                mv "$F" "${F}.full"
+                echo "${F}.full" >> "${RUNNER_TEMP}/artifacts.txt"
+              fi
+            done
+          fi
           while IFS= read -r SRC; do
             [ -n "$SRC" ] || continue
             # The build artifact carries the commit SHA so per-build uploads never
             # collide; the *release* assets use a clean, SHA-free name so consumers
             # can wget them from a stable .../releases/latest/download/<name> URL.
             RELEASE="$(basename "${SRC/-${SHA}/}")"
+            RELEASE="${RELEASE%.full}"
             SIZE=$(stat -c%s "$SRC")
             if [ "$SIZE" -ge "$LIMIT" ]; then
               echo "${RELEASE} is ${SIZE} bytes (>= ${LIMIT}); splitting into ${CHUNK_MIB} MiB numbered parts."
@@ -587,6 +628,7 @@ jobs:
               # Checksum recorded against the reassembled (clean) name so a consumer
               # can `sha256sum -c` it straight after concatenating the parts.
               echo "$(sha256sum "$SRC" | cut -d' ' -f1)  ${RELEASE}" > "${OUT}/${RELEASE}.sha256"
+              case "$SRC" in *.full) rm -f "$SRC" ;; esac
               SPLIT=1
             else
               echo "${RELEASE} is ${SIZE} bytes (< ${LIMIT}); uploading as a single asset."
@@ -598,7 +640,6 @@ jobs:
           # release without downloading the multi-GB tarball. The stable names are
           # symlinks to the timestamped files; -L copies the target. The machine
           # is already part of each name, so machines cannot collide.
-          read -ra MACHINE_LIST <<<"$MACHINES"
           for MACHINE in "${MACHINE_LIST[@]}"; do
             DIR=$(ls -dt build/tmp*/deploy/images/"$MACHINE" 2>/dev/null | head -n1 || true)
             [ -n "$DIR" ] || continue
@@ -631,20 +672,89 @@ jobs:
           fi
 
       - name: Create GitHub release
+        id: release
         if: success() && startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          # The staging dir holds one clean-named tarball per machine, or its
-          # .part*/.sha256 set when that tarball had to be split.
-          #
           # The body is replaced (not appended to) so re-running a tag build
           # regenerates the notes in place instead of stacking another copy
           # underneath the previous one.
           body_path: ${{ runner.temp }}/release-notes.md
-          files: |
-            ${{ runner.temp }}/release/*
-            ${{ inputs.artifact-name }}-${{ github.sha }}-kas-dump.yml
-            ${{ inputs.artifact-name }}-kas-dump.yml
+          # Kept as a draft until every asset is up; the next step publishes.
+          draft: true
+
+      - name: Upload release assets and publish
+        if: success() && startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ steps.release.outputs.id }}
+          UPLOAD_URL: ${{ steps.release.outputs.upload_url }}
+          # The staging dir holds one clean-named tarball per machine, or its
+          # .part*/.sha256 set when that tarball had to be split.
+          ASSET_DIR: ${{ runner.temp }}/release
+          KAS_DUMPS: ${{ inputs.artifact-name }}-${{ github.sha }}-kas-dump.yml ${{ inputs.artifact-name }}-kas-dump.yml
+        # Uploads one file at a time with retries. Uploading ~30 GB in
+        # parallel through action-gh-release hit transient GitHub 5xx errors
+        # with no retry, leaving the release as a draft. Assets already
+        # uploaded at the right size are skipped, so a re-run only sends
+        # what is missing.
+        shell: python3 {0}
+        run: |
+          import glob, http.client, json, os, sys, time
+          import urllib.error, urllib.parse, urllib.request
+
+          API = f"{os.environ['GITHUB_API_URL']}/repos/{os.environ['GITHUB_REPOSITORY']}"
+          RID = os.environ["RELEASE_ID"]
+          UPLOAD = os.environ["UPLOAD_URL"].split("{")[0]
+          HDRS = {"Authorization": f"Bearer {os.environ['GH_TOKEN']}",
+                  "Accept": "application/vnd.github+json"}
+
+          def call(method, url, data=None, extra=None, timeout=60):
+              req = urllib.request.Request(url, data=data, method=method,
+                                           headers={**HDRS, **(extra or {})})
+              with urllib.request.urlopen(req, timeout=timeout) as r:
+                  body = r.read()
+                  return json.loads(body) if body else None
+
+          def assets():
+              out, page = {}, 1
+              while True:
+                  got = call("GET", f"{API}/releases/{RID}/assets?per_page=100&page={page}")
+                  out.update({a["name"]: a for a in got})
+                  if len(got) < 100:
+                      return out
+                  page += 1
+
+          files = sorted(glob.glob(os.path.join(os.environ["ASSET_DIR"], "*")))
+          files += [f for f in os.environ["KAS_DUMPS"].split() if os.path.isfile(f)]
+
+          for path in files:
+              name, size = os.path.basename(path), os.path.getsize(path)
+              for attempt in range(1, 7):
+                  try:
+                      a = assets().get(name)
+                      if a and a["state"] == "uploaded" and a["size"] == size:
+                          print(f"{name}: already uploaded, skipping", flush=True)
+                          break
+                      # A failed upload can leave a partial asset behind.
+                      if a:
+                          call("DELETE", f"{API}/releases/assets/{a['id']}")
+                      print(f"{name}: uploading {size} bytes (attempt {attempt})", flush=True)
+                      with open(path, "rb") as f:
+                          call("POST", f"{UPLOAD}?name={urllib.parse.quote(name)}", data=f,
+                               extra={"Content-Type": "application/octet-stream",
+                                      "Content-Length": str(size)}, timeout=900)
+                      print(f"{name}: done", flush=True)
+                      break
+                  except (urllib.error.URLError, http.client.HTTPException, OSError) as e:
+                      print(f"::warning::{name}: upload attempt {attempt} failed: {e}", flush=True)
+                      time.sleep(min(30 * attempt, 180))
+              else:
+                  sys.exit(f"::error::{name}: upload failed after retries")
+
+          call("PATCH", f"{API}/releases/{RID}", data=json.dumps({"draft": False}).encode(),
+               extra={"Content-Type": "application/json"})
+          print("Release published", flush=True)
 
   notify:
     runs-on: ubuntu-latest
