@@ -54,6 +54,17 @@ on:
         required: false
         type: string
         default: ''
+      artifact-files:
+        description: >
+          Space-separated glob(s), matched in each machine's deploy dir, of
+          files to upload as one small workflow artifact named
+          <artifact-name>-files-<sha>, laid out as <machine>/<file>. For later
+          jobs that need a few build outputs without the whole deploy dir.
+          Symlinks are followed, so stable names are uploaded. Works with
+          upload-artifacts: false.
+        required: false
+        type: string
+        default: ''
       clean-checkout:
         description: >
           Run actions/checkout's clean step (git clean -ffdx && git reset
@@ -375,6 +386,44 @@ jobs:
           name: ${{ steps.pack.outputs.name-4 }}
           path: ${{ steps.pack.outputs.tar-4 }}
           retention-days: 30
+
+      - name: Collect artifact files
+        if: success() && inputs.artifact-files != ''
+        env:
+          MACHINES: ${{ inputs.machine }}
+          ARTIFACT_FILES: ${{ inputs.artifact-files }}
+        run: |
+          set -euo pipefail
+          OUT="${RUNNER_TEMP}/artifact-files"
+          rm -rf "$OUT"
+          read -ra MACHINE_LIST <<<"$MACHINES"
+          read -ra PATTERNS <<<"$ARTIFACT_FILES"
+          for MACHINE in "${MACHINE_LIST[@]}"; do
+            DIR=$(ls -dt build/tmp*/deploy/images/"$MACHINE" 2>/dev/null | head -n1 || true)
+            [ -n "$DIR" ] || continue
+            mkdir -p "${OUT}/${MACHINE}"
+            for PATTERN in "${PATTERNS[@]}"; do
+              find "$DIR" -maxdepth 1 \( -type f -o -type l \) -name "$PATTERN" -print0 |
+                while IFS= read -r -d '' F; do
+                  [ -e "$F" ] || continue
+                  cp -L "$F" "${OUT}/${MACHINE}/$(basename "$F")"
+                  echo "Artifact file: ${MACHINE}/$(basename "$F")"
+                done
+            done
+          done
+          if [ -z "$(find "$OUT" -type f | head -n1)" ]; then
+            echo "::error::no deploy files matched artifact-files '${ARTIFACT_FILES}'"
+            exit 1
+          fi
+
+      - name: Upload artifact files
+        if: success() && inputs.artifact-files != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact-name }}-files-${{ github.sha }}
+          path: ${{ runner.temp }}/artifact-files
+          compression-level: 0
+          retention-days: 7
 
       - name: Upload resolved KAS dump
         if: success()
