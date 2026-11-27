@@ -116,6 +116,11 @@ on:
         required: false
         type: string
         default: 'imx-runner'
+      kas-container-image:
+        description: 'kas container image to use (empty = kas-container default)'
+        type: string
+        required: false
+        default: ''
     secrets:
       SLACK_WEBHOOK_URL:
         required: true
@@ -252,9 +257,11 @@ jobs:
           # KAS_CI_EXTRA_CONFIG is appended by the cache-directory step: it adds
           # the generated hashequiv overlay, or is empty when that was skipped.
           KAS_CONFIG: ${{ inputs.kas-config }}
+          KAS_CONTAINER_IMAGE: ${{ inputs.kas-container-image }}
         run: |
           set -euo pipefail
           KAS_CONFIG="${KAS_CONFIG}${KAS_CI_EXTRA_CONFIG:-}"
+          if [ -z "${KAS_CONTAINER_IMAGE:-}" ]; then unset KAS_CONTAINER_IMAGE; fi
 
           echo "=== Building ${{ inputs.artifact-name }} ==="
           echo "=== Commit: $(git rev-parse HEAD) ==="
